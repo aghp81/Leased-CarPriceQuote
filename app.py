@@ -160,6 +160,8 @@ if catalog is not None and not catalog.empty:
         st.download_button("دانلود پیشنهادها به‌صورت CSV", affordable.to_csv(index=False).encode("utf-8-sig"), "پیشنهاد_لیزینگ.csv", "text/csv")
     st.caption(f"مبنای قیمت: {source_label} · تاریخ داده: {as_of} · زمان محاسبهٔ منبع: {computed_at or '—'} · این قیمت میانهٔ آگهی‌هاست، نه قیمت قطعی معامله؛ هزینه‌های جانبی و تأیید اعتبار در قسط لحاظ نشده‌اند.")
     with st.expander("مشاهدهٔ کل فهرست قیمت"):
-        st.dataframe(catalog.drop(columns=["قابل پرداخت"]), hide_index=True)
+        full_catalog = catalog.drop(columns=["قابل پرداخت"])
+        numeric_formats = {column: "{:,.0f}" for column in full_catalog.select_dtypes(include="number").columns}
+        st.dataframe(full_catalog.style.format(numeric_formats), hide_index=True)
 elif mode == "بارگذاری CSV" and catalog is None:
     st.info("فایل فهرست قیمت روز را بارگذاری کنید تا پیشنهادها محاسبه شوند.")
