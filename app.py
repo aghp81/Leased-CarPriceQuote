@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -41,56 +41,32 @@ def to_number(value):
 
 
 def extract_vehicles(payload):
-    """Normalize common catalog shapes; retain only entries with an identifiable name and price."""
-    found = []
-    seen = set()
-    name_keys = ("name", "nameFa", "title", "label", "displayName", "vehicleName", "modelName")
-    price_keys = ("medianPrice", "priceMedian", "price", "currentPrice", "marketPrice", "median_price")
-
-    def visit(node, context=None):
-        context = dict(context or {})
-        if isinstance(node, list):
-            for item in node:
-                visit(item, context)
-            return
-        if not isinstance(node, dict):
-            return
-        for key in ("brand", "brandName", "manufacturer", "category", "type"):
-            val = node.get(key)
-            if isinstance(val, str) and val.strip():
-                context[key] = val.strip()
-        name = next((node.get(k) for k in name_keys if isinstance(node.get(k), str) and node.get(k).strip()), None)
-        price = next((to_number(node.get(k)) for k in price_keys if to_number(node.get(k)) and to_number(node.get(k)) > 0), None)
-        if name and price:
-            item = {"خودرو": name.strip(), "قیمت روز (تومان)": price}
-            brand = context.get("brand") or context.get("brandName") or context.get("manufacturer")
-            if brand and brand.strip() != name.strip():
-                item["برند"] = brand
-            for label, keys in (("سال", ("year", "modelYear", "yearJalali")), ("تعداد داده", ("dataPoints", "sampleCount", "count"))):
-                val = next((node.get(k) for k in keys if node.get(k) is not None), None)
-                if val is not None:
-                    item[label] = val
-            if node.get("computedAt"):
-                item["تاریخ قیمت (UTC)"] = node["computedAt"]
-            if node.get("displayYear") is not None:
-                item["سال"] = node["displayYear"]
-            if node.get("coverage"):
-                item["پوشش داده"] = node["coverage"]
-            if node.get("slug"):
-                item["پیوند قیمت"] = f"https://nemuda.com/{node['slug']}"
-            key = (item["خودرو"], price)
-            if key not in seen:
-                seen.add(key)
-                found.append(item)
-        for key, val in node.items():
-            if isinstance(val, (dict, list)):
-                next_context = dict(context)
-                if isinstance(key, str) and key not in ("items", "data", "results", "vehicles", "models") and len(key) < 80:
-                    next_context.setdefault("name", key)
-                visit(val, next_context)
-
-    visit(payload)
-    return pd.DataFrame(found)
+    """Use only well-supported, year-specific passenger-car medians from the index."""
+    rows = []
+    for category in payload.get("categories", []):
+        if category.get("category") != "car":
+            continue
+        for brand in category.get("brands", []):
+            for model in brand.get("models", []):
+                for year in model.get("years", []):
+                    price = to_number(year.get("price"))
+                    points = int(year.get("dataPoints") or 0)
+                    # Avoid model-wide averages and thin samples that caused misleading offers.
+                    if not price or points < 20 or year.get("coverage") != "solid":
+                        continue
+                    price_range = year.get("priceRange") or {}
+                    rows.append(
+                        {
+                            "برند": brand.get("nameFa") or brand.get("nameLatin") or brand.get("slug"),
+                            "خودرو": model.get("nameFa") or model.get("nameLatin") or model.get("slug"),
+                            "سال ساخت": year.get("displayYear") or year.get("modelYear"),
+                            "قیمت میانه (تومان)": price,
+                            "کف بازه (تومان)": to_number(price_range.get("low")),
+                            "سقف بازه (تومان)": to_number(price_range.get("high")),
+                            "تعداد نمونه": points,
+                        }
+                    )
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
@@ -101,8 +77,7 @@ def load_live_prices():
     catalog = extract_vehicles(payload)
     if catalog.empty:
         raise ValueError("ساختار پاسخ منبع قیمت با قالب شناخته‌شده سازگار نیست.")
-    fetched = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
-    return catalog, fetched
+    return catalog, payload.get("asOf"), payload.get("computedAt"), payload.get("windowDays")
 
 
 def monthly_payment(price, down_payment_pct, annual_rate_pct, months):
@@ -134,39 +109,45 @@ m2.metric("حقوق ماهانه", f"{salary:,.0f} تومان")
 m3.metric("سهم حقوق برای قسط", f"{debt_ratio}٪")
 
 st.subheader("منبع قیمت خودرو")
-mode = st.radio("قیمت‌ها را از کجا بخوانیم؟", ["منبع آنلاین نمودا", "بارگذاری فهرست قیمت CSV"], horizontal=True)
+mode = st.segmented_control("قیمت‌ها را از کجا بخوانیم؟", ["قیمت آنلاین خودرو", "بارگذاری CSV"], default="قیمت آنلاین خودرو")
 catalog = None
-updated_at = None
+as_of = None
+computed_at = None
+window_days = None
 source_label = ""
-if mode == "منبع آنلاین نمودا":
-    if st.button("به‌روزرسانی قیمت‌ها", use_container_width=False):
+if mode == "قیمت آنلاین خودرو":
+    if st.button("به‌روزرسانی قیمت‌ها"):
         load_live_prices.clear()
     try:
         with st.spinner("در حال دریافت فهرست قیمت…"):
-            catalog, updated_at = load_live_prices()
+            catalog, as_of, computed_at, window_days = load_live_prices()
         source_label = "منبع آنلاین نمودا"
-        st.caption(f"آخرین دریافت از API: {updated_at} · دادهٔ قیمت منبع هر ۶ ساعت به‌روزرسانی می‌شود. [مستندات منبع]({SOURCE_URL})")
+        st.caption(f"فقط خودروهای سواری با پوشش دادهٔ کافی · تاریخ مبنای داده: {as_of} · بازهٔ محاسبه: {window_days} روز · [مستندات منبع قیمت]({SOURCE_URL})")
     except Exception as exc:
         st.warning(f"دریافت خودکار قیمت در دسترس نیست ({exc}). می‌توانید فهرست قیمت روز را به‌صورت CSV بارگذاری کنید.")
 else:
-    price_file = st.file_uploader("CSV فهرست خودرو و قیمت روز", type=["csv"])
+    price_file = st.file_uploader("CSV فهرست خودرو و قیمت روز (فقط خودرو)", type=["csv"])
     if price_file:
         try:
             raw = pd.read_csv(price_file)
-            st.caption("ستون‌های لازم: «خودرو» و «قیمت روز (تومان)». نام ستون‌های دیگر را پس از بارگذاری نگاشت کنید.")
+            st.caption("این فایل باید فقط خودرو داشته باشد. ستون قیمت را برحسب تومان انتخاب کنید.")
             name_col = st.selectbox("ستون نام خودرو", raw.columns)
             price_col = st.selectbox("ستون قیمت (تومان)", raw.columns, index=len(raw.columns) - 1)
-            catalog = pd.DataFrame({"خودرو": raw[name_col].astype(str), "قیمت روز (تومان)": raw[price_col].map(to_number)})
-            catalog = catalog.dropna(subset=["قیمت روز (تومان)"])
+            category_col = next((col for col in raw.columns if str(col).strip().lower() in {"category", "type", "نوع", "دسته", "دسته‌بندی", "نوع وسیله"}), None)
+            if category_col:
+                is_motorcycle = raw[category_col].astype(str).str.lower().str.contains(r"motorcycle|motorbike|موتورسیکلت|موتور سیکلت", regex=True)
+                raw = raw.loc[~is_motorcycle]
+            catalog = pd.DataFrame({"خودرو": raw[name_col].astype(str), "قیمت میانه (تومان)": raw[price_col].map(to_number)})
+            catalog = catalog.dropna(subset=["قیمت میانه (تومان)"])
             source_label = f"فایل {price_file.name}"
-            updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+            as_of = datetime.now().strftime("%Y-%m-%d %H:%M")
         except Exception as exc:
             st.error(f"خواندن CSV ممکن نشد: {exc}")
 
 if catalog is not None and not catalog.empty:
-    catalog = catalog[catalog["قیمت روز (تومان)"] > 0].copy()
-    catalog["پیش‌پرداخت (تومان)"] = catalog["قیمت روز (تومان)"] * down_pct / 100
-    catalog["قسط ماهانه (تومان)"] = catalog["قیمت روز (تومان)"].map(lambda p: monthly_payment(p, down_pct, annual_rate, term_months))
+    catalog = catalog[catalog["قیمت میانه (تومان)"] > 0].copy()
+    catalog["پیش‌پرداخت (تومان)"] = catalog["قیمت میانه (تومان)"] * down_pct / 100
+    catalog["قسط ماهانه (تومان)"] = catalog["قیمت میانه (تومان)"].map(lambda p: monthly_payment(p, down_pct, annual_rate, term_months))
     catalog["قابل پرداخت"] = catalog["قسط ماهانه (تومان)"] <= max_installment
     affordable = catalog[catalog["قابل پرداخت"]].sort_values("قسط ماهانه (تومان)")
     st.subheader("پیشنهادهای متناسب با بودجهٔ شما")
@@ -175,10 +156,10 @@ if catalog is not None and not catalog.empty:
         st.info(f"با این تنظیمات خودرویی زیر سقف قسط شما پیدا نشد. کمترین قسط در فهرست {min_payment:,.0f} تومان است.")
     else:
         st.success(f"{len(affordable)} خودرو در سقف قسط شما پیدا شد.")
-        st.dataframe(affordable.drop(columns=["قابل پرداخت"]).rename(columns={"خودرو": "خودرو", "قیمت روز (تومان)": "قیمت نقدی (تومان)"}).style.format({"قیمت نقدی (تومان)": "{:,.0f}", "پیش‌پرداخت (تومان)": "{:,.0f}", "قسط ماهانه (تومان)": "{:,.0f}"}), use_container_width=True, hide_index=True)
+        st.dataframe(affordable.drop(columns=["قابل پرداخت"]).style.format({col: "{:,.0f}" for col in affordable.select_dtypes(include="number").columns}), hide_index=True)
         st.download_button("دانلود پیشنهادها به‌صورت CSV", affordable.to_csv(index=False).encode("utf-8-sig"), "پیشنهاد_لیزینگ.csv", "text/csv")
-    st.caption(f"مبنای قیمت: {source_label} · دریافت فایل/داده: {updated_at} · قیمت بازار ممکن است تغییر کند؛ مبلغ قرارداد، هزینه‌های جانبی و تأیید اعتبار در این تخمین محاسبه نشده‌اند.")
+    st.caption(f"مبنای قیمت: {source_label} · تاریخ داده: {as_of} · زمان محاسبهٔ منبع: {computed_at or '—'} · این قیمت میانهٔ آگهی‌هاست، نه قیمت قطعی معامله؛ هزینه‌های جانبی و تأیید اعتبار در قسط لحاظ نشده‌اند.")
     with st.expander("مشاهدهٔ کل فهرست قیمت"):
-        st.dataframe(catalog.drop(columns=["قابل پرداخت"]), use_container_width=True, hide_index=True)
-elif mode == "بارگذاری فهرست قیمت CSV" and catalog is None:
+        st.dataframe(catalog.drop(columns=["قابل پرداخت"]), hide_index=True)
+elif mode == "بارگذاری CSV" and catalog is None:
     st.info("فایل فهرست قیمت روز را بارگذاری کنید تا پیشنهادها محاسبه شوند.")
